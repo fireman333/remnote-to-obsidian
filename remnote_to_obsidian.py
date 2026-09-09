@@ -15,7 +15,7 @@ Usage:
 Requirements: Python 3.9+, no external packages.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import argparse
 import hashlib
@@ -50,6 +50,7 @@ class Stats:
     portals_removed: int = 0
     metadata_lines_removed: int = 0
     flashcard_markers_removed: int = 0
+    flashcards_converted: int = 0
     recursion_lines_removed: int = 0
     empty_bullets_removed: int = 0
     filenames_decoded: int = 0
@@ -66,6 +67,27 @@ class Stats:
     dedup_files_converted: int = 0
     dedup_lines_before: int = 0
     dedup_lines_after: int = 0
+    dedup_lines_preserved: int = 0
+    # Errors — never silently swallowed
+    read_errors: int = 0
+    write_errors: int = 0
+
+
+@dataclass
+class Options:
+    """Conversion behaviour switches.
+
+    flashcards: how to treat RemNote flashcard markup.
+        "preserve" — leave markup untouched (default; never loses information)
+        "anki"     — rewrite to flashcards-obsidian / Anki syntax
+        "strip"    — delete the markers (pre-1.1 behaviour; loses card semantics)
+    portals: "mark" leaves an auditable callout where a Portal block was,
+        "remove" deletes it silently (pre-1.1 behaviour).
+    template_dirs: directory names treated as template/slot definitions.
+    """
+    flashcards: str = "preserve"
+    portals: str = "mark"
+    template_dirs: tuple = ("Dz",)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -132,6 +154,9 @@ METADATA_PATTERN = re.compile(
 )
 
 
+ALIAS_ITEM_PATTERN = re.compile(r"^(?:\d+\.|[-*])\s*")
+
+
 def extract_aliases(lines: list[str]) -> list[str]:
     aliases: list[str] = []
     in_aliases = False
@@ -144,10 +169,8 @@ def extract_aliases(lines: list[str]) -> list[str]:
             alias_indent = indent
             continue
         if in_aliases:
-            if indent > alias_indent and stripped.startswith(
-                ("1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.")
-            ):
-                alias_text = re.sub(r"^\d+\.\s*", "", stripped).strip()
+            if indent > alias_indent and ALIAS_ITEM_PATTERN.match(stripped):
+                alias_text = ALIAS_ITEM_PATTERN.sub("", stripped).strip()
                 if alias_text:
                     aliases.append(alias_text)
             elif indent <= alias_indent:
@@ -191,7 +214,17 @@ def remove_metadata_lines(lines: list[str], stats: Stats) -> list[str]:
 
 # --- Transformer 2: Remove portals -------------------------------------------
 
-def remove_portals(lines: list[str], stats: Stats) -> list[str]:
+PORTAL_MARKER = "Portal ---------------------"
+
+
+def remove_portals(lines: list[str], stats: Stats,
+                   mode: str = "mark") -> list[str]:
+    """Drop Portal transclusion blocks.
+
+    A Portal mirrors content that also lives at its source Rem, so the block
+    itself is redundant. With mode="mark" (default) a callout is left behind so
+    the removal stays auditable; mode="remove" deletes it without a trace.
+    """
     result: list[str] = []
     skip_until_indent = -1
     for line in lines:
@@ -205,9 +238,15 @@ def remove_portals(lines: list[str], stats: Stats) -> list[str]:
             else:
                 skip_until_indent = -1
 
-        if "Portal ---------------------" in stripped:
+        if PORTAL_MARKER in stripped:
             skip_until_indent = indent
             stats.portals_removed += 1
+            if mode == "mark":
+                result.append(
+                    " " * indent
+                    + "- > [!note] RemNote Portal removed — "
+                    + "the content lives at its source Rem"
+                )
             continue
 
         if stripped.startswith("-- Avoided infinite recursion --"):
@@ -223,15 +262,17 @@ def remove_portals(lines: list[str], stats: Stats) -> list[str]:
 LINK_PATTERN = re.compile(r"(?<!!)\[([^\]]*)\]\(([^)]*)\)")
 
 
-def is_dz_template_path(decoded_path: str, current_dir: str) -> bool:
+def is_template_path(decoded_path: str, current_dir: str,
+                     template_dirs: tuple) -> bool:
     resolved = os.path.normpath(os.path.join(current_dir, decoded_path))
     parts = Path(resolved).parts
-    return "Dz" in parts
+    return any(d in parts for d in template_dirs)
 
 
 def convert_links(
     line: str, current_file_rel: str,
-    basename_index: dict[str, list[str]], stats: Stats
+    basename_index: dict[str, list[str]], stats: Stats,
+    template_dirs: tuple = ("Dz",)
 ) -> str:
     current_dir = os.path.dirname(current_file_rel)
 
@@ -256,7 +297,7 @@ def convert_links(
             stats.links_empty_path += 1
             return display_text if display_text else "PDF Reference"
 
-        if is_dz_template_path(decoded_path, current_dir):
+        if is_template_path(decoded_path, current_dir, template_dirs):
             stats.links_dz_template += 1
             return f"**{display_text.strip()}**" if display_text.strip() else ""
 
@@ -309,13 +350,57 @@ def convert_highlights(line: str, stats: Stats) -> str:
     return new_line
 
 
-# --- Transformer 6: Remove flashcard markers ----------------------------------
+# --- Transformer 6: Flashcards ------------------------------------------------
+#
+# RemNote encodes several card types inline. Deleting the markup (the pre-1.1
+# behaviour) throws away which lines were cards at all, and RemNote exports
+# carry no review history, so a stripped export cannot be rebuilt into a deck
+# by hand. Default is therefore "preserve": leave the markup alone.
+#
+# NOTE: the exact marker set below is derived from RemNote's documented syntax.
+# Verify it against your own export before relying on mode="anki".
 
 FLASHCARD_LIST_PATTERN = re.compile(r"\s*>>>\s*$")
 FLASHCARD_NUM_PATTERN = re.compile(r"\s*>>\d+\.\s*$")
+FLASHCARD_FORWARD_PATTERN = re.compile(r"[ \t]*(?<![>\\])>>(?!>)[ \t]*")
+CLOZE_PATTERN = re.compile(r"\{\{(?!c\d+::)([^{}]+)\}\}")
 
 
-def remove_flashcard_markers(line: str, stats: Stats) -> str:
+def _to_anki(line: str, stats: Stats) -> str:
+    """Rewrite RemNote card markup to flashcards-obsidian / Anki syntax."""
+    original = line
+
+    # Cloze: {{text}} -> {{c1::text}} (already-numbered clozes are left alone)
+    def _cloze(m: "re.Match") -> str:
+        return "{{c1::" + m.group(1) + "}}"
+
+    line = CLOZE_PATTERN.sub(_cloze, line)
+
+    # Trailing list-card markers carry no front/back pair — tag the line instead
+    # of deleting it, so the card is still findable after conversion.
+    stripped_list = FLASHCARD_LIST_PATTERN.sub("", line)
+    if stripped_list != line:
+        line = stripped_list.rstrip() + " #card"
+    else:
+        stripped_num = FLASHCARD_NUM_PATTERN.sub("", line)
+        if stripped_num != line:
+            line = stripped_num.rstrip() + " #card"
+
+    # Front/back separator: "Q >> A" -> "Q :: A"
+    line = FLASHCARD_FORWARD_PATTERN.sub(" :: ", line)
+
+    if line != original:
+        stats.flashcards_converted += 1
+    return line
+
+
+def convert_flashcards(line: str, stats: Stats,
+                       mode: str = "preserve") -> str:
+    if mode == "preserve":
+        return line
+    if mode == "anki":
+        return _to_anki(line, stats)
+    # mode == "strip" — legacy behaviour, kept for reproducing old runs
     new_line = FLASHCARD_LIST_PATTERN.sub("", line)
     if new_line != line:
         stats.flashcard_markers_removed += 1
@@ -364,9 +449,13 @@ def generate_frontmatter(title: str, aliases: list[str]) -> list[str]:
 
 # --- File processing pipeline ------------------------------------------------
 
+CODE_FENCE_PATTERN = re.compile(r"^\s*(?:-\s*)?(?:```|~~~)")
+
+
 def process_file(
     source_path: str, rel_path: str,
-    basename_index: dict[str, list[str]], stats: Stats
+    basename_index: dict[str, list[str]], stats: Stats,
+    options: "Options | None" = None
 ) -> tuple[str, list[str]]:
     """Process a single file. Returns (rename_hint, content_lines)."""
     with open(source_path, "r", encoding="utf-8") as f:
@@ -394,15 +483,28 @@ def process_file(
     if aliases:
         stats.aliases_extracted += len(aliases)
 
-    lines = remove_metadata_lines(lines, stats)
-    lines = remove_portals(lines, stats)
+    opts = options or Options()
 
+    lines = remove_metadata_lines(lines, stats)
+    lines = remove_portals(lines, stats, opts.portals)
+
+    # Fenced code blocks are copied through untouched — their contents are not
+    # markdown and must not be rewritten by the transformers below.
     processed: list[str] = []
+    in_code_block = False
     for line in lines:
-        line = convert_links(line, rel_path, basename_index, stats)
+        if CODE_FENCE_PATTERN.match(line):
+            in_code_block = not in_code_block
+            processed.append(line)
+            continue
+        if in_code_block:
+            processed.append(line)
+            continue
+        line = convert_links(line, rel_path, basename_index, stats,
+                             opts.template_dirs)
         line = convert_tag_wikilinks(line)
         line = convert_highlights(line, stats)
-        line = remove_flashcard_markers(line, stats)
+        line = convert_flashcards(line, stats, opts.flashcards)
         processed.append(line)
 
     processed = clean_empty_bullets(processed, stats)
@@ -443,7 +545,8 @@ def write_output(
 # --- Phase 1 entry point -----------------------------------------------------
 
 def phase1_convert(source_dir: str, output_dir: str, stats: Stats,
-                   verbose: bool = False) -> None:
+                   verbose: bool = False,
+                   options: "Options | None" = None) -> None:
     print("=" * 60)
     print("Phase 1: Converting RemNote markdown → Obsidian")
     print("=" * 60)
@@ -464,7 +567,7 @@ def phase1_convert(source_dir: str, output_dir: str, stats: Stats,
                 print(f"    {rel_path}")
 
             rename_hint, content_lines = process_file(
-                source_path, rel_path, basename_index, stats
+                source_path, rel_path, basename_index, stats, options
             )
             stats.files_processed += 1
             write_output(output_dir, rel_path, rename_hint, content_lines, stats)
@@ -476,7 +579,8 @@ def phase1_convert(source_dir: str, output_dir: str, stats: Stats,
     print(f"  Highlights: {stats.highlights_converted}")
     print(f"  Portal lines removed: {stats.portals_removed}")
     print(f"  Metadata lines removed: {stats.metadata_lines_removed}")
-    print(f"  Flashcard markers: {stats.flashcard_markers_removed}")
+    print(f"  Flashcard markers removed: {stats.flashcard_markers_removed}")
+    print(f"  Flashcard lines converted: {stats.flashcards_converted}")
     print(f"  Aliases extracted: {stats.aliases_extracted}")
     print()
 
@@ -498,7 +602,7 @@ RETRY_COUNT = 3
 RETRY_DELAY = 2
 
 
-def scan_image_urls(vault_dir: str) -> dict[str, set[str]]:
+def scan_image_urls(vault_dir: str, stats: Stats) -> dict[str, set[str]]:
     url_map: dict[str, set[str]] = {}
     for root, _dirs, files in os.walk(vault_dir):
         for fname in files:
@@ -508,7 +612,9 @@ def scan_image_urls(vault_dir: str) -> dict[str, set[str]]:
             try:
                 with open(fpath, "r", encoding="utf-8") as f:
                     content = f.read()
-            except Exception:
+            except OSError as e:
+                stats.read_errors += 1
+                print(f"  WARNING: cannot read {fpath}: {e}", file=sys.stderr)
                 continue
             for m in IMAGE_URL_PATTERN.finditer(content):
                 url_map.setdefault(m.group(2), set()).add(fpath)
@@ -518,11 +624,19 @@ def scan_image_urls(vault_dir: str) -> dict[str, set[str]]:
 
 
 def url_to_local_filename(url: str) -> str:
+    """Map a remote URL to a unique local filename.
+
+    Two different URLs can end in the same segment (".../a/image.png" and
+    ".../b/image.png"), so the digest of the full URL is always part of the
+    name — otherwise one image silently overwrites the other, and the
+    "already downloaded" check then hands both notes the same picture.
+    """
     url_path = url.split("/")[-1].split("?")[0]
-    if len(url_path) <= 150:
-        return url_path
-    ext = os.path.splitext(url_path)[1] or ".png"
-    return hashlib.md5(url.encode()).hexdigest()[:16] + ext
+    stem, ext = os.path.splitext(url_path)
+    ext = ext or ".png"
+    digest = hashlib.md5(url.encode()).hexdigest()[:12]
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]", "_", stem)[:100].strip("._-")
+    return f"{safe_stem}-{digest}{ext}" if safe_stem else f"{digest}{ext}"
 
 
 def download_image(url: str, local_path: str) -> tuple[bool, str]:
@@ -608,7 +722,7 @@ def download_all_images(
 
 
 def update_image_links(
-    url_map: dict[str, set[str]], url_to_name: dict[str, str]
+    url_map: dict[str, set[str]], url_to_name: dict[str, str], stats: Stats
 ) -> tuple[int, int]:
     files_to_update: dict[str, set[str]] = {}
     for url, filepaths in url_map.items():
@@ -624,7 +738,9 @@ def update_image_links(
         try:
             with open(fpath, "r", encoding="utf-8") as f:
                 content = f.read()
-        except Exception:
+        except OSError as e:
+            stats.read_errors += 1
+            print(f"  WARNING: cannot read {fpath}: {e}", file=sys.stderr)
             continue
 
         original = content
@@ -639,8 +755,13 @@ def update_image_links(
             content = p2.sub(local_embed, content)
 
         if content != original:
-            with open(fpath, "w", encoding="utf-8") as f:
-                f.write(content)
+            try:
+                with open(fpath, "w", encoding="utf-8") as f:
+                    f.write(content)
+            except OSError as e:
+                stats.write_errors += 1
+                print(f"  WARNING: cannot write {fpath}: {e}", file=sys.stderr)
+                continue
             files_updated += 1
             links_replaced += (
                 original.count("remnote-user-data.s3.amazonaws.com")
@@ -657,7 +778,7 @@ def phase2_images(output_dir: str, stats: Stats) -> None:
 
     attachments_dir = os.path.join(output_dir, "attachments")
 
-    url_map = scan_image_urls(output_dir)
+    url_map = scan_image_urls(output_dir, stats)
     stats.images_found = len(url_map)
     total_refs = sum(len(v) for v in url_map.values())
     print(f"  Found {len(url_map)} unique images ({total_refs} references)")
@@ -671,7 +792,8 @@ def phase2_images(output_dir: str, stats: Stats) -> None:
     stats.images_downloaded = len(url_to_name)
     stats.images_failed = len(url_map) - len(url_to_name)
 
-    files_updated, links_replaced = update_image_links(url_map, url_to_name)
+    files_updated, links_replaced = update_image_links(
+        url_map, url_to_name, stats)
     stats.image_files_updated = files_updated
     stats.image_links_replaced = links_replaced
 
@@ -712,21 +834,86 @@ def parse_frontmatter(filepath: str) -> dict:
     if end_idx <= 0:
         return fm
     aliases = []
+    in_aliases = False
     for line in lines[1:end_idx]:
         stripped = line.strip()
         if stripped.startswith("title:"):
             fm["title"] = stripped[6:].strip().strip('"').strip("'")
-        elif stripped.startswith('- "'):
-            aliases.append(stripped[3:].rstrip('"'))
+            in_aliases = False
+        elif stripped.startswith("aliases:"):
+            in_aliases = True
+        elif in_aliases and stripped.startswith("- "):
+            aliases.append(stripped[2:].strip().strip('"').strip("'"))
+        elif stripped and not stripped.startswith("- "):
+            # any other top-level key ends the aliases block
+            in_aliases = False
     if aliases:
         fm["aliases"] = aliases
     return fm
 
 
+def normalize_for_compare(line: str) -> str:
+    """Strip indentation and bullet markup so aggregated copies compare equal."""
+    return re.sub(r"^\s*(?:[-*+]|\d+\.)\s*", "", line).strip()
+
+
+def read_body_lines(filepath: str) -> list[str]:
+    """Return a file's lines with any YAML frontmatter block removed."""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            lines = f.read().split("\n")
+    except OSError:
+        return []
+    if lines and lines[0].strip() == "---":
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                return lines[i + 1:]
+    return lines
+
+
+def collect_child_lines(child_folder: str) -> set[str]:
+    """Every normalized line contained anywhere under a child folder."""
+    seen: set[str] = set()
+    for root, _dirs, files in os.walk(child_folder):
+        for fname in files:
+            if not fname.endswith(".md"):
+                continue
+            for line in read_body_lines(os.path.join(root, fname)):
+                norm = normalize_for_compare(line)
+                if norm:
+                    seen.add(norm)
+    return seen
+
+
+def find_parent_only_lines(parent_path: str, child_folder: str) -> list[str]:
+    """Parent lines that appear nowhere in the child subtree.
+
+    RemNote's export writes a parent .md that aggregates its children, but a
+    parent Rem can also carry content of its own (a summary, a comparison
+    table, exam notes) that exists in no child file. Rebuilding the parent
+    purely from the folder listing destroys exactly that content, so it is
+    carried over into the MOC instead.
+
+    A parent line that happens to be textually identical to some child line is
+    treated as aggregated. That is deliberate: the text still exists in the
+    child, so nothing is lost.
+    """
+    child_lines = collect_child_lines(child_folder)
+    kept: list[str] = []
+    for line in read_body_lines(parent_path):
+        norm = normalize_for_compare(line)
+        if not norm:
+            continue
+        if norm in child_lines:
+            continue
+        kept.append(line.rstrip())
+    return kept
+
+
 def build_moc_content(
     title: str, frontmatter: dict,
     child_files: list[str], child_dirs: list[str],
-    folder_rel: str
+    folder_rel: str, parent_only: list[str] | None = None
 ) -> str:
     lines = ["---", f'title: "{title}"']
     aliases = frontmatter.get("aliases", [])
@@ -749,6 +936,10 @@ def build_moc_content(
 
     if not child_files and not orphan_dirs:
         lines.append("*(empty)*")
+
+    if parent_only:
+        lines.extend(["", "## Notes", ""])
+        lines.extend(parent_only)
 
     lines.append("")
     return "\n".join(lines)
@@ -788,7 +979,11 @@ def phase3_dedup(output_dir: str, stats: Stats) -> None:
         if not child_files and not child_dirs:
             continue
 
-        moc = build_moc_content(title, fm, child_files, child_dirs, folder_rel)
+        parent_only = find_parent_only_lines(parent_path, child_folder)
+        stats.dedup_lines_preserved += len(parent_only)
+
+        moc = build_moc_content(title, fm, child_files, child_dirs,
+                                folder_rel, parent_only)
         moc_lines = moc.count("\n") + 1
 
         with open(parent_path, "w", encoding="utf-8") as f:
@@ -803,6 +998,7 @@ def phase3_dedup(output_dir: str, stats: Stats) -> None:
     print(f"  Converted {stats.dedup_files_converted} files to MOC")
     print(f"  Lines: {stats.dedup_lines_before:,} → {stats.dedup_lines_after:,} "
           f"(removed {saved:,}, {pct:.1f}%)")
+    print(f"  Parent-only lines preserved: {stats.dedup_lines_preserved:,}")
     print()
 
 
@@ -823,7 +1019,8 @@ def print_summary(stats: Stats, output_dir: str) -> None:
     print(f"  Highlights (^^→==):       {stats.highlights_converted}")
     print(f"  Portal lines removed:     {stats.portals_removed}")
     print(f"  Metadata lines removed:   {stats.metadata_lines_removed}")
-    print(f"  Flashcard markers:        {stats.flashcard_markers_removed}")
+    print(f"  Flashcard markers removed:{stats.flashcard_markers_removed}")
+    print(f"  Flashcard lines converted:{stats.flashcards_converted}")
     print(f"  Aliases extracted:        {stats.aliases_extracted}")
     print()
     print("Phase 2 — Images:")
@@ -836,7 +1033,12 @@ def print_summary(stats: Stats, output_dir: str) -> None:
     print(f"  Parent→MOC converted:     {stats.dedup_files_converted}")
     saved = stats.dedup_lines_before - stats.dedup_lines_after
     print(f"  Duplicate lines removed:  {saved:,}")
+    print(f"  Parent-only lines kept:   {stats.dedup_lines_preserved:,}")
     print()
+    if stats.read_errors or stats.write_errors:
+        print(f"WARNING: {stats.read_errors} read error(s), "
+              f"{stats.write_errors} write error(s) — see messages above.")
+        print()
     print(f"Obsidian vault ready at: {output_dir}")
     print("Open this folder in Obsidian as a new vault to get started.")
 
@@ -862,6 +1064,9 @@ Examples:
 
   # Only convert markdown (no images, no dedup):
   python3 remnote_to_obsidian.py ~/Downloads/RemNoteExport ~/ObsidianVault --skip-images --skip-dedup
+
+  # Rewrite flashcards for Anki, and treat Sx/ as a template folder too:
+  python3 remnote_to_obsidian.py ~/Downloads/RemNoteExport ~/ObsidianVault --flashcards anki --template-dirs Dz,Sx
 """,
     )
     parser.add_argument("source_dir", help="Path to RemNote export directory")
@@ -870,6 +1075,17 @@ Examples:
                         help="Skip downloading images (Phase 2)")
     parser.add_argument("--skip-dedup", action="store_true",
                         help="Skip deduplication (Phase 3)")
+    parser.add_argument("--flashcards", choices=["preserve", "anki", "strip"],
+                        default="preserve",
+                        help="Flashcard markup: preserve it (default), rewrite "
+                             "to Anki/flashcards-obsidian syntax, or strip the "
+                             "markers (loses which lines were cards)")
+    parser.add_argument("--portals", choices=["mark", "remove"], default="mark",
+                        help="Portal blocks: leave an auditable callout "
+                             "(default) or delete without a trace")
+    parser.add_argument("--template-dirs", default="Dz",
+                        help="Comma-separated folder names holding template "
+                             "slot definitions (default: Dz)")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Print each file being processed")
     parser.add_argument("--version", action="version",
@@ -896,9 +1112,17 @@ Examples:
     print()
 
     stats = Stats()
+    options = Options(
+        flashcards=args.flashcards,
+        portals=args.portals,
+        template_dirs=tuple(
+            d.strip() for d in args.template_dirs.split(",") if d.strip()
+        ),
+    )
 
     # Phase 1: Always run
-    phase1_convert(source_dir, output_dir, stats, verbose=args.verbose)
+    phase1_convert(source_dir, output_dir, stats, verbose=args.verbose,
+                   options=options)
 
     # Phase 2: Images (optional)
     if not args.skip_images:

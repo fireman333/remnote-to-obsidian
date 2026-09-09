@@ -10,9 +10,9 @@ The script runs three phases in one command:
 
 | Phase | What | Details |
 |-------|------|---------|
-| **1. Convert** | RemNote syntax → Obsidian markdown | Wikilinks, highlights, metadata cleanup, portal removal, flashcard markers |
+| **1. Convert** | RemNote syntax → Obsidian markdown | Wikilinks, highlights, metadata cleanup, portal handling, flashcard handling |
 | **2. Images** | Download remote images → local | Parallel download from RemNote S3, rewrite to `![[attachments/...]]` |
-| **3. Dedup** | Parent files → MOC pages | Collapse duplicated parent aggregation files into Map of Content pages |
+| **3. Dedup** | Parent files → MOC pages | Collapse duplicated parent aggregation files into Map of Content pages, keeping any parent-only content |
 
 ### Conversion details
 
@@ -20,15 +20,15 @@ The script runs three phases in one command:
 |---------|----------|---------|
 | `[text](url-encoded/path.md)` | `[[Note Name\|text]]` | Wikilinks with shortest-path resolution |
 | `^^highlight^^` | `==highlight==` | Also handles `^^^` and `^^^^^^` variants |
-| `Portal ---------------------` blocks | Removed | Content exists at source location |
+| `Portal ---------------------` blocks | Callout marker (or removed) | Content exists at source location; `--portals` controls this |
 | `[Status]();-[Draft]()` etc. | Removed | RemNote-specific metadata |
 | `[ViewerData]`, `[ReadPercent]`, ... | Removed | PDF viewer state, read progress |
-| `>>>` / `>>N.` flashcard markers | Removed | End-of-line cloze markers |
+| `>>` / `{{...}}` / `>>>` / `>>N.` flashcards | Preserved by default | `--flashcards anki` rewrites them; see [Flashcards](#flashcards) |
 | `#[[Tag Name]]` | `[[Tag Name]]` | RemNote nested tag syntax |
 | `[text](../Dz/Summary.md)` | `**text**` | Template slot references → bold labels |
 | `[text]()` empty-path links | `text` | Concept references → plain text |
 | `-- Avoided infinite recursion --` | Removed | Portal recursion guards |
-| `![](https://remnote-user-data.s3...)` | `![[attachments/file.png]]` | Downloaded locally |
+| `![](https://remnote-user-data.s3...)` | `![[attachments/file-<hash>.png]]` | Downloaded locally; the URL hash keeps same-named images apart |
 | `%LOCAL_FILE%hash.pdf.md` | PDF reference stub note | With Obsidian callout |
 | `&#8211;` in filenames | `–` (decoded) | HTML entities in filenames |
 | `[Aliases]()` sub-items | YAML `aliases:` frontmatter | Extracted to Obsidian properties |
@@ -56,6 +56,9 @@ python3 remnote_to_obsidian.py <source_dir> <output_dir> [options]
 |------|-------------|
 | `--skip-images` | Skip downloading images (Phase 2). Use for offline or fast conversion. |
 | `--skip-dedup` | Skip deduplication (Phase 3). Keep parent files with full content. |
+| `--flashcards {preserve,anki,strip}` | How to treat flashcard markup. Default `preserve`. See [Flashcards](#flashcards). |
+| `--portals {mark,remove}` | Leave an auditable callout where a Portal block was (`mark`, default), or delete it silently (`remove`). |
+| `--template-dirs Dz,Sx` | Comma-separated folders holding template slot definitions. Default `Dz`. |
 | `--verbose`, `-v` | Print each file being processed. |
 | `--version` | Show version number. |
 
@@ -70,7 +73,27 @@ python3 remnote_to_obsidian.py ./RemNoteExport ./MyVault --skip-images --skip-de
 
 # Convert + dedup, but skip images (e.g. no internet):
 python3 remnote_to_obsidian.py ./RemNoteExport ./MyVault --skip-images
+
+# Rewrite flashcards for Anki, and treat Sx/ as a template folder too:
+python3 remnote_to_obsidian.py ./RemNoteExport ./MyVault --flashcards anki --template-dirs Dz,Sx
 ```
+
+## Flashcards
+
+RemNote exports carry **no review history or scheduling data** — that state
+cannot leave RemNote in any export format. What the export does carry is the
+card *markup*, and that is worth keeping: it is the only record of which lines
+were cards at all.
+
+| Mode | Behaviour |
+|------|-----------|
+| `preserve` (default) | Markup is left exactly as exported. Nothing is lost. |
+| `anki` | `Q >> A` → `Q :: A`, `{{text}}` → `{{c1::text}}`, trailing `>>>` / `>>N.` → `#card`. Targets [flashcards-obsidian](https://github.com/reuseman/flashcards-obsidian) / Anki. |
+| `strip` | Deletes the markers (the pre-1.1 behaviour). Loses which lines were cards. |
+
+The marker set is derived from RemNote's documented syntax. **Verify `anki`
+mode against your own export before running it over a whole vault** — run it on
+a copy of one folder first and check the result.
 
 ## Output structure
 
@@ -125,6 +148,20 @@ all content from the child folder (`Topics/`). This duplicates content massively
 1. Finds all `.md` files with a matching same-name folder
 2. Processes deepest pairs first (bottom-up)
 3. Replaces parent content with a MOC page linking to each child
+4. Any parent line that appears nowhere in the child subtree is carried over
+   under a `## Notes` heading — a parent Rem can hold a summary or comparison
+   table of its own, and rebuilding the page from the folder listing alone
+   would destroy it
+
+## Tests
+
+```bash
+python3 -m unittest test_remnote_to_obsidian -v
+```
+
+Zero dependencies. Each test pins a defect that silently lost data in v1.0.0:
+code-block contents being rewritten, flashcard markup being deleted, parent-only
+content being destroyed by dedup, and same-named images overwriting each other.
 
 ## Tested with
 
