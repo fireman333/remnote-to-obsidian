@@ -155,6 +155,26 @@ METADATA_PATTERN = re.compile(
 
 
 ALIAS_ITEM_PATTERN = re.compile(r"^(?:\d+\.|[-*])\s*")
+CODE_FENCE_PATTERN = re.compile(r"^\s*(?:-\s*)?(?:```|~~~)")
+INLINE_CODE_PATTERN = re.compile(r"`[^`\n]+`")
+
+
+def apply_outside_inline_code(line: str, transform) -> str:
+    """Run `transform` on the parts of a line that are not inline code.
+
+    Backtick spans carry source too — a right-shift `a >> 2` must not become
+    `a :: 2`, and a `[t](p.md)` shown as an example must stay literal.
+    """
+    if "`" not in line:
+        return transform(line)
+    out: list[str] = []
+    last = 0
+    for m in INLINE_CODE_PATTERN.finditer(line):
+        out.append(transform(line[last:m.start()]))
+        out.append(m.group(0))
+        last = m.end()
+    out.append(transform(line[last:]))
+    return "".join(out)
 
 
 def extract_aliases(lines: list[str]) -> list[str]:
@@ -178,7 +198,21 @@ def extract_aliases(lines: list[str]) -> list[str]:
     return aliases
 
 
-def remove_metadata_lines(lines: list[str], stats: Stats) -> list[str]:
+def compute_code_mask(lines: list[str]) -> list[bool]:
+    """Mark every line that sits inside (or is) a fenced code block."""
+    mask: list[bool] = []
+    in_block = False
+    for line in lines:
+        if CODE_FENCE_PATTERN.match(line):
+            in_block = not in_block
+            mask.append(True)
+        else:
+            mask.append(in_block)
+    return mask
+
+
+def remove_metadata_lines(lines: list[str], stats: Stats,
+                          code_mask: "list[bool] | None" = None) -> list[str]:
     result: list[str] = []
     skip_until_indent = -1
     i = 0
@@ -186,6 +220,12 @@ def remove_metadata_lines(lines: list[str], stats: Stats) -> list[str]:
         line = lines[i]
         stripped = line.lstrip()
         indent = len(line) - len(stripped)
+
+        if code_mask is not None and code_mask[i]:
+            skip_until_indent = -1
+            result.append(line)
+            i += 1
+            continue
 
         if skip_until_indent >= 0:
             if indent > skip_until_indent:
@@ -218,7 +258,8 @@ PORTAL_MARKER = "Portal ---------------------"
 
 
 def remove_portals(lines: list[str], stats: Stats,
-                   mode: str = "mark") -> list[str]:
+                   mode: str = "mark",
+                   code_mask: "list[bool] | None" = None) -> list[str]:
     """Drop Portal transclusion blocks.
 
     A Portal mirrors content that also lives at its source Rem, so the block
@@ -227,9 +268,14 @@ def remove_portals(lines: list[str], stats: Stats,
     """
     result: list[str] = []
     skip_until_indent = -1
-    for line in lines:
+    for i, line in enumerate(lines):
         stripped = line.lstrip()
         indent = len(line) - len(stripped)
+
+        if code_mask is not None and code_mask[i]:
+            skip_until_indent = -1
+            result.append(line)
+            continue
 
         if skip_until_indent >= 0:
             if indent > skip_until_indent:
@@ -449,9 +495,6 @@ def generate_frontmatter(title: str, aliases: list[str]) -> list[str]:
 
 # --- File processing pipeline ------------------------------------------------
 
-CODE_FENCE_PATTERN = re.compile(r"^\s*(?:-\s*)?(?:```|~~~)")
-
-
 def process_file(
     source_path: str, rel_path: str,
     basename_index: dict[str, list[str]], stats: Stats,
@@ -485,11 +528,13 @@ def process_file(
 
     opts = options or Options()
 
-    lines = remove_metadata_lines(lines, stats)
-    lines = remove_portals(lines, stats, opts.portals)
+    # Fenced code blocks hold source, not markdown, so every transformer has to
+    # leave them alone — including the two that delete whole indented ranges.
+    code_mask = compute_code_mask(lines)
+    lines = remove_metadata_lines(lines, stats, code_mask)
+    lines = remove_portals(lines, stats, opts.portals,
+                           compute_code_mask(lines))
 
-    # Fenced code blocks are copied through untouched — their contents are not
-    # markdown and must not be rewritten by the transformers below.
     processed: list[str] = []
     in_code_block = False
     for line in lines:
@@ -500,12 +545,16 @@ def process_file(
         if in_code_block:
             processed.append(line)
             continue
-        line = convert_links(line, rel_path, basename_index, stats,
-                             opts.template_dirs)
-        line = convert_tag_wikilinks(line)
-        line = convert_highlights(line, stats)
-        line = convert_flashcards(line, stats, opts.flashcards)
-        processed.append(line)
+
+        def _transform(segment: str) -> str:
+            segment = convert_links(segment, rel_path, basename_index, stats,
+                                    opts.template_dirs)
+            segment = convert_tag_wikilinks(segment)
+            segment = convert_highlights(segment, stats)
+            segment = convert_flashcards(segment, stats, opts.flashcards)
+            return segment
+
+        processed.append(apply_outside_inline_code(line, _transform))
 
     processed = clean_empty_bullets(processed, stats)
     frontmatter = generate_frontmatter(title, aliases)
@@ -514,10 +563,21 @@ def process_file(
 
 # --- Output writing -----------------------------------------------------------
 
+ILLEGAL_FILENAME_CHARS = re.compile(r'[/\\:*?"<>|]')
+
+
 def sanitize_filename(name: str) -> str:
+    """Make one path component safe to write.
+
+    Names can come from note content (a PDF's [Name] field, say), so a value
+    containing "/" would otherwise escape into a different directory — or land
+    on a path another note already claimed, overwriting it without a word.
+    """
     name = html.unescape(name)
     name = re.sub(r"[\x00-\x1f]", "", name)
-    return name
+    name = ILLEGAL_FILENAME_CHARS.sub("-", name)
+    name = name.strip(". ")
+    return name or "untitled"
 
 
 def write_output(
@@ -913,7 +973,7 @@ def find_parent_only_lines(parent_path: str, child_folder: str) -> list[str]:
 def build_moc_content(
     title: str, frontmatter: dict,
     child_files: list[str], child_dirs: list[str],
-    folder_rel: str, parent_only: list[str] | None = None
+    folder_rel: str, parent_only: "list[str] | None" = None
 ) -> str:
     lines = ["---", f'title: "{title}"']
     aliases = frontmatter.get("aliases", [])

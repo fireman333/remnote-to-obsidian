@@ -236,6 +236,98 @@ class DedupPreservesParentOnlyContent(unittest.TestCase):
         self.assertIn("[[Cardiology/Heart failure|Heart failure]]", body)
 
 
+class InlineCodeProtection(unittest.TestCase):
+    """Backtick spans hold source too — transformers must not rewrite them."""
+
+    def test_right_shift_in_inline_code_survives_anki_mode(self):
+        out, _ = convert(["- shift right with `a >> 2` in R"],
+                         options=r2o.Options(flashcards="anki"))
+        body = "\n".join(out)
+        self.assertIn("`a >> 2`", body)
+        self.assertNotIn("a :: 2", body)
+
+    def test_markup_outside_inline_code_still_converts(self):
+        out, _ = convert(["- `a >> 2` and a card Q >> A"],
+                         options=r2o.Options(flashcards="anki"))
+        body = "\n".join(out)
+        self.assertIn("`a >> 2`", body)
+        self.assertIn("Q :: A", body)
+
+    def test_link_syntax_inside_inline_code_is_literal(self):
+        out, _ = convert(["- write `[text](path.md)` like this"])
+        self.assertIn("`[text](path.md)`", "\n".join(out))
+
+
+class CodeBlockShieldsLineDeleters(unittest.TestCase):
+    """remove_metadata_lines/remove_portals delete whole indented ranges and
+    ran before the fence check, so code blocks were not safe from them."""
+
+    def test_portal_marker_inside_code_block_is_kept(self):
+        out, _ = convert([
+            "- Doc",
+            "    - ```text",
+            "    - Portal ---------------------",
+            "    - still inside the block",
+            "    - ```",
+            "    - real content",
+        ])
+        body = "\n".join(out)
+        self.assertIn("Portal ---------------------", body)
+        self.assertIn("still inside the block", body)
+        self.assertIn("real content", body)
+
+    def test_metadata_marker_inside_code_block_is_kept(self):
+        out, _ = convert([
+            "- Doc",
+            "    - ```text",
+            "    - [Status]();-[Draft]()",
+            "    - ```",
+        ])
+        self.assertIn("[Status]()", "\n".join(out))
+
+    def test_real_metadata_outside_code_block_is_still_removed(self):
+        out, _ = convert(["- Doc", "    - [Status]();-[Draft]()"])
+        self.assertNotIn("[Status]()", "\n".join(out))
+
+
+class FilenameSanitizing(unittest.TestCase):
+    """A name lifted from note content could contain a path separator, so two
+    notes could resolve to one path and one would overwrite the other."""
+
+    def test_path_separators_are_neutralised(self):
+        self.assertNotIn("/", r2o.sanitize_filename("Guidelines/2024/AHA.pdf"))
+
+    def test_distinct_names_stay_distinct(self):
+        a = r2o.sanitize_filename("a/b")
+        b = r2o.sanitize_filename("a/c")
+        self.assertNotEqual(a, b)
+
+    def test_other_illegal_characters_are_replaced(self):
+        out = r2o.sanitize_filename('what: is this? <x>|y*')
+        for ch in ':?<>|*':
+            self.assertNotIn(ch, out)
+
+    def test_empty_result_falls_back(self):
+        self.assertEqual(r2o.sanitize_filename("..."), "untitled")
+
+    def test_ordinary_names_are_untouched(self):
+        self.assertEqual(r2o.sanitize_filename("Heart failure"),
+                         "Heart failure")
+
+
+class PythonVersionFloor(unittest.TestCase):
+    """The script advertises Python 3.9+; PEP 604 unions would break that."""
+
+    def test_no_bare_pep604_unions_in_annotations(self):
+        import re as _re
+        src = open("remnote_to_obsidian.py", encoding="utf-8").read()
+        # a bare "X | None" outside quotes in an annotation fails on 3.9
+        bad = [ln for ln in src.split("\n")
+               if _re.search(r":\s*[A-Za-z_][\w\[\], ]*\s\|\s*None\s*=", ln)
+               and '"' not in ln]
+        self.assertEqual(bad, [])
+
+
 class HighlightConversion(unittest.TestCase):
     def test_double_caret_becomes_obsidian_highlight(self):
         stats = r2o.Stats()

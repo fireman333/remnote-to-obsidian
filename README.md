@@ -60,6 +60,8 @@ python3 remnote_to_obsidian.py <source_dir> <output_dir> [options]
 | `--portals {mark,remove}` | Leave an auditable callout where a Portal block was (`mark`, default), or delete it silently (`remove`). |
 | `--template-dirs Dz,Sx` | Comma-separated folders holding template slot definitions. Default `Dz`. |
 | `--verbose`, `-v` | Print each file being processed. |
+| | |
+| *Note* | Attachment filenames include a hash of the source URL. If you converted with v1.0.0, its `attachments/` folder will not be reused — re-run into a fresh output directory. |
 | `--version` | Show version number. |
 
 ### Examples
@@ -127,8 +129,11 @@ Set the attachment folder path for best results:
    - Convert `[text](path.md)` links to `[[wikilinks]]`
    - Convert `#[[Tag]]` to `[[Tag]]`
    - Convert `^^highlight^^` to `==highlight==`
-   - Remove flashcard markers (`>>>`, `>>N.`)
+   - Handle flashcard markup per `--flashcards`
    - Clean empty bullet lines
+
+   Fenced code blocks and inline backtick spans are copied through untouched —
+   they hold source, not markdown.
 3. Generates YAML frontmatter with title and extracted aliases
 4. Writes to output directory with sanitized filenames
 
@@ -159,9 +164,12 @@ all content from the child folder (`Topics/`). This duplicates content massively
 python3 -m unittest test_remnote_to_obsidian -v
 ```
 
-Zero dependencies. Each test pins a defect that silently lost data in v1.0.0:
-code-block contents being rewritten, flashcard markup being deleted, parent-only
-content being destroyed by dedup, and same-named images overwriting each other.
+Zero dependencies, 33 cases. Each test pins a defect that silently lost data:
+code-block and inline-code contents being rewritten, flashcard markup being
+deleted, parent-only content being destroyed by dedup, same-named images
+overwriting each other, and filenames with a `/` in them colliding.
+
+Verified on Python 3.9 and 3.12.
 
 ## Tested with
 
